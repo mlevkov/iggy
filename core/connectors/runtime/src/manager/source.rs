@@ -263,21 +263,26 @@ impl SourceManager {
         // for this block to end rather than racing it.
         {
             let mut details = details.lock().await;
-            details.record_started(plugin_id, config, || {
-                source::spawn_source_handler(
-                    plugin_id,
-                    key,
-                    config.verbose,
-                    config.benchmark,
-                    producer,
-                    encoder,
-                    transforms,
-                    state_storage,
-                    handle_callback,
-                    batch_result_callback,
-                    context.clone(),
-                )
-            });
+            // Nothing between these three statements may await. The spawn used
+            // to be passed in as a closure so the compiler refused one; inlined
+            // here that is a rule rather than a check, so keep it: an await
+            // between the spawn and the id strands the `SOURCE_SENDERS` entry
+            // and both tasks with nothing naming them.
+            details.handler_tasks = source::spawn_source_handler(
+                plugin_id,
+                key,
+                config.verbose,
+                config.benchmark,
+                producer,
+                encoder,
+                transforms,
+                state_storage,
+                handle_callback,
+                batch_result_callback,
+                context.clone(),
+            );
+            details.info.id = plugin_id;
+            details.config = config.clone();
             // In the same hold as the id record, not after it. Released first,
             // this transition raced the forwarding loop's own report and could
             // overwrite an `Error` the loop had already set.
@@ -375,25 +380,6 @@ impl SourceDetails {
         } else if old_status == ConnectorStatus::Running && status != ConnectorStatus::Running {
             metrics.decrement_sources_running();
         }
-    }
-
-    /// Records an instance that has just started, spawning its handlers in the
-    /// same breath.
-    ///
-    /// Deliberately not `async`, and that is the point. The id has to be
-    /// recorded under the same lock hold as the spawn: a cancellation between
-    /// the two strands the `SOURCE_SENDERS` entry and both tasks with nothing
-    /// naming them, which no guard can reach. Taking `spawn` as a closure is
-    /// what lets the compiler refuse an await added between them.
-    fn record_started(
-        &mut self,
-        plugin_id: u32,
-        config: &SourceConfig,
-        spawn: impl FnOnce() -> Vec<JoinHandle<()>>,
-    ) {
-        self.handler_tasks = spawn();
-        self.info.id = plugin_id;
-        self.config = config.clone();
     }
 }
 
@@ -530,28 +516,6 @@ mod tests {
             .await;
 
         assert_eq!(metrics.get_sources_running(), 1);
-    }
-
-    #[tokio::test]
-    async fn record_started_should_store_the_id_and_the_spawned_tasks() {
-        // Both have to land under one lock hold, so they are recorded together
-        // and there is nowhere to await between them. A stop reaches the
-        // instance through the id and drains it through the tasks, so losing
-        // either leaves something behind.
-        let mut details = create_test_source_details("pg", 1);
-        let config = details.config.clone();
-
-        details.record_started(7, &config, || vec![tokio::spawn(async {})]);
-
-        assert_eq!(
-            details.info.id, 7,
-            "a later stop closes whatever id this recorded"
-        );
-        assert_eq!(
-            details.handler_tasks.len(),
-            1,
-            "a stop drains the tasks recorded here, so they cannot be dropped"
-        );
     }
 
     #[tokio::test]

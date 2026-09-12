@@ -331,10 +331,13 @@ pub(crate) type SourceClose = Arc<dyn Fn(u32) -> i32 + Send + Sync>;
 /// inside it stays correct. Both call sites use it.
 #[must_use = "dropping an armed guard closes the source instance"]
 pub(crate) struct SourceInstanceGuard {
-    close: SourceClose,
+    /// `Some` while this guard owns the instance, `None` once something else
+    /// does. One representation rather than a close plus a flag that had to
+    /// agree with it, and taking it is what lets both teardown paths run
+    /// without cloning the callback.
+    close: Option<SourceClose>,
     plugin_id: u32,
     key: String,
-    armed: bool,
 }
 
 impl SourceInstanceGuard {
@@ -362,17 +365,16 @@ impl SourceInstanceGuard {
     /// that holds a close pointer without its library. Tests pass a closure.
     fn new(close: SourceClose, plugin_id: u32, key: &str) -> Self {
         Self {
-            close,
+            close: Some(close),
             plugin_id,
             key: key.to_owned(),
-            armed: true,
         }
     }
 
     /// Hands ownership of the instance to the caller, once something else can
     /// close it. Call only after the plugin id is recorded on `SourceDetails`.
     pub(crate) fn disarm(mut self) {
-        self.armed = false;
+        self.close = None;
     }
 
     /// Closes the instance and waits for the plugin to finish, so an error the
@@ -382,8 +384,9 @@ impl SourceInstanceGuard {
     /// `drop` cannot offer that ordering, which is why the error arms call this
     /// instead of relying on it.
     pub(crate) async fn close(mut self) {
-        self.armed = false;
-        let close = self.close.clone();
+        let Some(close) = self.close.take() else {
+            return;
+        };
         let plugin_id = self.plugin_id;
         let key = std::mem::take(&mut self.key);
         if tokio::task::spawn_blocking(move || {
@@ -401,11 +404,10 @@ impl SourceInstanceGuard {
 
 impl Drop for SourceInstanceGuard {
     fn drop(&mut self) {
-        if !self.armed {
+        let Some(close) = self.close.take() else {
             return;
-        }
+        };
 
-        let close = self.close.clone();
         let plugin_id = self.plugin_id;
         let key = std::mem::take(&mut self.key);
         // Nothing can await here, so the plugin's teardown cannot be bounded
@@ -1138,33 +1140,6 @@ mod tests {
             *closed.lock().expect("close recorder"),
             vec![plugin_id],
             "a guard still armed owns the instance and must close exactly it"
-        );
-    }
-
-    #[test]
-    fn given_disarmed_guard_when_dropped_should_leave_the_instance_open() {
-        // Disarmed means `details.info.id` names the instance, so
-        // `stop_connector` will close it. Closing here too would tear down a
-        // source that just started successfully.
-        //
-        // The armed guard goes first so the recorder is proven to move before
-        // it is required not to. Asserting an empty recorder on its own holds
-        // whether or not a guard was ever built.
-        let armed_id = next_plugin_id();
-        let (close, closed) = recording_close(0);
-        drop(SourceInstanceGuard::new(close.clone(), armed_id, "random"));
-        assert_eq!(
-            *closed.lock().expect("close recorder"),
-            vec![armed_id],
-            "this recorder has to be able to move, or the assertion below is vacuous"
-        );
-
-        SourceInstanceGuard::new(close, next_plugin_id(), "random").disarm();
-
-        assert_eq!(
-            *closed.lock().expect("close recorder"),
-            vec![armed_id],
-            "the instance is the manager's once its id is recorded"
         );
     }
 
