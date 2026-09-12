@@ -240,10 +240,9 @@ impl SourceManager {
             match source::setup_source_producer(key, config, iggy_client).await {
                 Ok(parts) => parts,
                 Err(error) => {
-                    // Closed here rather than left to `drop` so this error
-                    // reaches the caller after teardown, not alongside it.
-                    // `drop` stays the net for a cancellation, and for any `?`
-                    // added inside this window later.
+                    // Awaited rather than left to `drop`, so this error reaches
+                    // the caller after teardown. `drop` stays the net for a
+                    // cancellation and for a `?` added here later.
                     instance_guard.close().await;
                     return Err(error);
                 }
@@ -520,7 +519,7 @@ mod tests {
 
     #[tokio::test]
     async fn should_not_double_count_when_an_error_falls_between_two_running_reports() {
-        // The interleaving spetz measured on #4064: the forwarding loop reports
+        // The interleaving that double counts: the forwarding loop reports
         // `Running`, fails its first batch, and a second `Running` report lands
         // afterwards. That second report crosses into `Running` again, so it
         // increments a gauge the error never gave back, and the instance is

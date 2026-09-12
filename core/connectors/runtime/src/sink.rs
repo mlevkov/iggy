@@ -19,7 +19,7 @@ use crate::benchmark;
 use crate::configs::connectors::SinkConfig;
 use crate::context::RuntimeContext;
 use crate::log::LOG_CALLBACK;
-use crate::metrics::{Metrics, SinkLabels};
+use crate::metrics::{ConnectorType, Metrics, SinkLabels};
 use crate::{
     FailedPlugin, PLUGIN_ID, RuntimeError, SinkApi, SinkConnector, SinkConnectorConsumer,
     SinkConnectorPlugin, SinkConnectorWrapper, close_plugin_instance, resolve_plugin_path,
@@ -184,7 +184,7 @@ pub async fn init(
                     .get_mut(&path)
                     .expect("sink connector was inserted above");
                 let close = connector.container.iggy_sink_close;
-                close_plugin_instance(&|id| close(id), "sink", plugin_id, &key);
+                close_plugin_instance(&|id| close(id), ConnectorType::Sink, plugin_id, &key);
                 if let Some(plugin) = connector
                     .plugins
                     .iter_mut()

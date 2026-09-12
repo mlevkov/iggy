@@ -42,6 +42,7 @@ use crate::benchmark;
 use crate::configs::connectors::SourceConfig;
 use crate::context::RuntimeContext;
 use crate::log::LOG_CALLBACK;
+use crate::metrics::ConnectorType;
 use crate::metrics::SourceLabels;
 use crate::{
     FailedPlugin, PLUGIN_ID, RuntimeError, SourceApi, SourceConnector, SourceConnectorPlugin,
@@ -312,23 +313,27 @@ pub(crate) fn init_source(
 }
 
 /// A plugin's `iggy_source_close` together with whatever keeps the library that
-/// exports it mapped. Held instead of the bare `extern "C" fn` so the call stays
-/// valid once it is deferred off the calling thread.
+/// exports it mapped, so the call stays valid once it is deferred off the
+/// calling thread.
 pub(crate) type SourceClose = Arc<dyn Fn(u32) -> i32 + Send + Sync>;
 
 /// Closes a source instance that `iggy_source_open` created and nothing else
 /// will ever reach.
 ///
-/// Between `init_source` succeeding and the plugin id being recorded on
-/// `SourceDetails`, the instance exists inside the plugin and nothing outside
-/// it knows the id: `stop_connector` closes whatever `details.info.id` holds,
-/// which is still the previous instance. An early return in that window
-/// stranded the new one for the life of the process.
+/// Between `init_source` succeeding and the plugin id reaching `SourceDetails`,
+/// the instance exists inside the plugin and nothing outside it knows the id:
+/// `stop_connector` closes whatever `details.info.id` holds, which is still the
+/// previous instance. An early return there stranded the new one for the life
+/// of the process. A guard rather than a cleanup branch per fallible call,
+/// because the window is those two statements rather than whichever call
+/// between them is fallible today, so a `?` added inside it stays correct.
+/// Startup and restart both hand off through it.
 ///
-/// A guard rather than a cleanup branch on each fallible call, because the
-/// window is defined by the two statements that open and record the instance,
-/// not by which call between them happens to be fallible today. Adding a `?`
-/// inside it stays correct. Both call sites use it.
+/// Teardown runs two ways and they are not interchangeable. [`Self::close`]
+/// awaits, so an error returned after it means the instance is already gone
+/// and an immediate retry has nothing to collide with. `Drop` cannot await, so
+/// it hands the work to the blocking pool; the closure carries the container,
+/// which is what keeps the library mapped until the call returns.
 #[must_use = "dropping an armed guard closes the source instance"]
 pub(crate) struct SourceInstanceGuard {
     /// `Some` while this guard owns the instance, `None` once something else
@@ -342,13 +347,8 @@ pub(crate) struct SourceInstanceGuard {
 
 impl SourceInstanceGuard {
     /// Arms a guard over an instance the caller has just opened through
-    /// `container`.
-    ///
-    /// The captured `Arc` is the point. `iggy_source_close` is a pointer read
-    /// out of a `dlopen`ed library and stays callable only while something
-    /// keeps that library mapped, so the guard owns the container rather than
-    /// relying on it being declared before the guard and therefore dropped
-    /// after it.
+    /// `container`, which it captures rather than borrows for the reason the
+    /// type documents.
     pub(crate) fn for_container(
         container: Arc<Container<SourceApi>>,
         plugin_id: u32,
@@ -377,12 +377,8 @@ impl SourceInstanceGuard {
         self.close = None;
     }
 
-    /// Closes the instance and waits for the plugin to finish, so an error the
-    /// caller returns afterwards means the instance is already gone. A restart
-    /// retried straight away then has nothing left to collide with.
-    ///
-    /// `drop` cannot offer that ordering, which is why the error arms call this
-    /// instead of relying on it.
+    /// The awaited half of the teardown the type documents. Error arms call it
+    /// rather than leaving the work to `Drop`, which cannot offer the ordering.
     pub(crate) async fn close(mut self) {
         let Some(close) = self.close.take() else {
             return;
@@ -390,7 +386,7 @@ impl SourceInstanceGuard {
         let plugin_id = self.plugin_id;
         let key = std::mem::take(&mut self.key);
         if tokio::task::spawn_blocking(move || {
-            close_plugin_instance(close.as_ref(), "source", plugin_id, &key)
+            close_plugin_instance(close.as_ref(), ConnectorType::Source, plugin_id, &key)
         })
         .await
         .is_err()
@@ -410,20 +406,17 @@ impl Drop for SourceInstanceGuard {
 
         let plugin_id = self.plugin_id;
         let key = std::mem::take(&mut self.key);
-        // Nothing can await here, so the plugin's teardown cannot be bounded
-        // here either: `SourceContainer::close` drives the plugin's own
-        // `close()` under `block_on`, and that runs for as long as the plugin
-        // takes. Hand it to the blocking pool, where blocking is what the
-        // thread is for. The closure carries the container, so the library
-        // stays mapped until the call returns.
+        // `SourceContainer::close` drives the plugin's own `close()` under
+        // `block_on` and runs for as long as the plugin takes, so it goes to
+        // the blocking pool where blocking is what the thread is for.
         match Handle::try_current() {
             Ok(handle) => {
                 handle.spawn_blocking(move || {
-                    close_plugin_instance(close.as_ref(), "source", plugin_id, &key)
+                    close_plugin_instance(close.as_ref(), ConnectorType::Source, plugin_id, &key)
                 });
             }
             // No runtime to hand it to, and no worker to protect either.
-            Err(_) => close_plugin_instance(close.as_ref(), "source", plugin_id, &key),
+            Err(_) => close_plugin_instance(close.as_ref(), ConnectorType::Source, plugin_id, &key),
         }
     }
 }

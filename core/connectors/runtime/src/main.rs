@@ -18,6 +18,7 @@
 use crate::configs::connectors::{
     ConnectorKey, ConnectorsConfig, ConnectorsConfigProvider, create_connectors_config_provider,
 };
+use crate::metrics::ConnectorType;
 use ::configs::ConfigProvider;
 use clap::Parser;
 use configs::connectors::ConfigFormat;
@@ -460,16 +461,18 @@ struct SinkConnectorWrapper {
 /// rather than returning it: every caller is already on a failure path with an
 /// error of its own to surface.
 ///
-/// `kind` is "source" or "sink". The two sides had this body inline, one word
-/// apart.
+/// The two sides had this body inline, one word apart. That word is the label
+/// [`ConnectorType`] already defines, so it is taken as the enum rather than a
+/// string nothing constrains.
 pub(crate) fn close_plugin_instance(
     close: &dyn Fn(u32) -> i32,
-    kind: &str,
+    kind: ConnectorType,
     plugin_id: u32,
     key: &str,
 ) {
     let close_result = close(plugin_id);
     if close_result != 0 {
+        let kind = kind.as_label();
         warn!(
             "iggy_{kind}_close returned {close_result} while cleaning up failed {kind} connector with ID: {plugin_id} ({key})"
         );
